@@ -2,9 +2,10 @@
 
 Routes a workflow's jobs to Badgery when it is healthy and has what they ask
 for, and to your own fallback runners when it is not: Badgery down or
-unreachable, no connected host offering the label, or a label Badgery does not
-have. A busy but healthy Badgery keeps the job; this is a health check, not a
-scheduler.
+unreachable, or a label no Badgery machine offers at all. When machines offer
+the label but none is ready (one restarting, say), the picker waits out the
+repository's grace period first. A busy but healthy Badgery keeps the job;
+this is a health check, not a scheduler.
 
 ```yaml
 jobs:
@@ -36,9 +37,14 @@ Several routes at once, one output per key:
 ```
 
 `server` defaults to `https://hooks.badgery.ai`; a self-hosted Badgery passes
-its own public origin. Fallback is off until it is turned on for the
-repository in the dashboard; until then the picker always answers Badgery,
-except when Badgery cannot be reached at all.
+its own public origin.
+
+On Badgery's hosted service fallback is off until it is turned on for the
+repository in the dashboard, and until then Badgery answers "Badgery" for
+every route. A self-hosted Badgery has no dashboard to turn it on from, so the
+picker being in the workflow is the opt-in there. Either way, when the picker
+itself cannot get an answer — Badgery unreachable, an error, no OIDC token —
+it chooses the fallback: that is the case it exists for.
 
 It fails open: if Badgery errors, refuses, or cannot be reached within two
 seconds, the job goes to your fallback. Every output is one of the two labels

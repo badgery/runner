@@ -48,6 +48,11 @@ function parseRoutes(env) {
     seen.add(r.key)
     if (!LABEL.test(r.want)) throw new Error(`bad want label for ${r.key}: ${r.want}`)
     if (!LABEL.test(r.fallback)) throw new Error(`bad fallback label for ${r.key}: ${r.fallback}`)
+    // A fallback Badgery would also serve is no fallback: every Badgery
+    // runner carries its badgery- labels and self-hosted.
+    if (/^badgery-/i.test(r.fallback) || r.fallback.toLowerCase() === 'self-hosted') {
+      throw new Error(`fallback for ${r.key} must be your own runners, not ${r.fallback}`)
+    }
   }
   return out
 }
@@ -133,51 +138,66 @@ async function ask(server, token, routes) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // decide never throws once the routes are parsed: every failure is a fallback
-// with its reason.
+// with its reason. A route's first final answer (want, or fallback) stands;
+// only routes Badgery called unhealthy are asked again, until the grace
+// period ends.
 async function decide(env, routes, { now = Date.now, wait = sleep } = {}) {
-  const fallbackAll = (reason) => Object.fromEntries(routes.map((r) => [r.key, { label: r.fallback, reason }]))
+  // No prototype: a route may be named anything a key allows, `constructor`
+  // included, and must not find an answer it was never given.
+  const settled = Object.create(null)
+  const settle = (r, label, reason) => { settled[r.key] = { label, reason } }
+  const unsettled = () => routes.filter((r) => !settled[r.key])
+  const fallbackRest = (reason) => {
+    for (const r of unsettled()) settle(r, r.fallback, reason)
+    return settled
+  }
   let server
   try {
     server = serverURL(env.INPUT_SERVER || 'https://hooks.badgery.ai')
   } catch (e) {
-    return fallbackAll(e.message)
-  }
-  let token
-  try {
-    token = await idToken(env, server.origin)
-  } catch (e) {
-    return fallbackAll(e.message)
+    return fallbackRest(e.message)
   }
   const started = now()
   let deadline = null
   let failures = 0
   for (;;) {
+    const pending = unsettled()
     let result
     try {
-      result = await ask(server, token, routes)
+      // A fresh token for every ask: GitHub's last about five minutes, and
+      // a grace period can run to thirty.
+      let token
+      try {
+        token = await idToken(env, server.origin)
+      } catch (e) {
+        if (deadline === null) return fallbackRest(e.message)
+        throw e
+      }
+      result = await ask(server, token, pending)
       failures = 0
     } catch (e) {
       // A Badgery that was answering and then stopped gets one more try.
       failures++
-      if (deadline === null || failures > 1 || now() + RETRY_MS >= deadline) {
-        return fallbackAll(`Badgery unreachable: ${e.message}`)
+      if (deadline === null || failures > 1 || now() >= deadline) {
+        return fallbackRest(`Badgery unreachable: ${e.message}`)
       }
-      await wait(RETRY_MS)
+      await wait(Math.min(RETRY_MS, Math.max(0, deadline - now())))
       continue
     }
     if (deadline === null) deadline = started + result.graceMs
-    const pending = routes.filter((r) => result.verdicts[r.key].answer === 'unhealthy')
-    if (pending.length === 0 || now() + RETRY_MS >= deadline) {
-      return Object.fromEntries(
-        routes.map((r) => {
-          const v = result.verdicts[r.key]
-          if (v.answer === 'want') return [r.key, { label: r.want, reason: 'Badgery is healthy and has it' }]
-          const why = v.answer === 'unhealthy' ? `Badgery unhealthy past the grace period: ${v.reason}` : v.reason
-          return [r.key, { label: r.fallback, reason: why || 'Badgery declined' }]
-        }),
-      )
+    const why = {}
+    for (const r of pending) {
+      const v = result.verdicts[r.key]
+      if (v.answer === 'want') settle(r, r.want, 'Badgery is healthy and has it')
+      else if (v.answer === 'fallback') settle(r, r.fallback, v.reason || 'Badgery declined')
+      else why[r.key] = v.reason
     }
-    await wait(RETRY_MS)
+    if (unsettled().length === 0) return settled
+    if (now() >= deadline) {
+      for (const r of unsettled()) settle(r, r.fallback, `Badgery unhealthy past the grace period: ${why[r.key] || 'no reason given'}`)
+      return settled
+    }
+    await wait(Math.min(RETRY_MS, deadline - now()))
   }
 }
 

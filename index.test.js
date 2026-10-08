@@ -19,6 +19,13 @@ async function stub(answers) {
       res.end(JSON.stringify({ value: 'oidc-token' }))
       return
     }
+    // Only the pick endpoint answers: a picker that asked anywhere else would
+    // otherwise pass every test.
+    if (req.method !== 'POST' || req.url !== '/runner/pick') {
+      res.statusCode = 404
+      res.end()
+      return
+    }
     let body = ''
     req.on('data', (c) => (body += c))
     req.on('end', () => {
@@ -65,6 +72,9 @@ test('routes: want/fallback or a routes block, never both, labels checked', () =
   assert.throws(() => parseRoutes({ INPUT_WANT: 'badgery-linux' }), /fallback/)
   assert.throws(() => parseRoutes({ INPUT_WANT: 'a b', INPUT_FALLBACK: 'c' }))
   assert.throws(() => parseRoutes({ INPUT_ROUTES: 'a: x -> y\na: x -> z' }), /repeated/)
+  // A fallback Badgery would serve too is no fallback.
+  assert.throws(() => parseRoutes({ INPUT_WANT: 'badgery-linux', INPUT_FALLBACK: 'badgery-macos' }), /your own runners/)
+  assert.throws(() => parseRoutes({ INPUT_WANT: 'badgery-linux', INPUT_FALLBACK: 'self-hosted' }), /your own runners/)
 })
 
 test('server: https origin only, http just for loopback', () => {
@@ -133,7 +143,9 @@ test('grace is capped at 30 minutes whatever the server says', async () => {
     const c = clock()
     const start = c.now()
     await decide(s.env(), one, c)
+    // Waits out the whole thirty minutes, and not a moment past it.
     assert.ok(c.now() - start <= 30 * 60_000)
+    assert.ok(c.now() - start >= 30 * 60_000 - 10_000, `stopped at ${c.now() - start} ms`)
   } finally {
     await s.close()
   }
@@ -189,7 +201,9 @@ test('black-holed Badgery costs the connect timeout, not the request timeout', a
     const got = await decide(env, one, clock())
     const took = Date.now() - start
     assert.equal(got.runner.label, 'macos-15')
-    assert.ok(took < 4_000, `took ${took} ms`)
+    // Under the 10 s request timeout: the connect timeout is what ended it.
+    // Generous above the 2 s it should take, for a loaded runner.
+    assert.ok(took < 9_000, `took ${took} ms`)
   } finally {
     await s.close()
   }
@@ -208,4 +222,59 @@ test('outputs are only ever the workflow’s own labels', () => {
   }
   assert.equal(fs.readFileSync(env.GITHUB_OUTPUT, 'utf8'), 'a=badgery-linux\nb=macos-15\n')
   fs.rmSync(dir, { recursive: true })
+})
+
+test('a route named like an Object property is still decided', async () => {
+  const routes = parseRoutes({ INPUT_ROUTES: 'constructor: badgery-linux -> ubuntu-latest' })
+  const s = await stub([{ labels: { constructor: { answer: 'fallback', reason: 'no Linux' } }, graceSeconds: 0 }])
+  try {
+    const got = await decide(s.env(), routes, clock())
+    assert.equal(got.constructor.label, 'ubuntu-latest')
+    assert.equal(s.seen.picks.length, 1)
+  } finally {
+    await s.close()
+  }
+})
+
+test('a fresh token for every ask, since a grace period outlasts one', async () => {
+  const s = await stub([verdict('unhealthy'), verdict('unhealthy'), verdict('want')])
+  try {
+    await decide(s.env(), one, clock())
+    assert.equal(s.seen.picks.length, 3)
+    assert.equal(s.seen.audiences.length, 3)
+  } finally {
+    await s.close()
+  }
+})
+
+test('a grace period shorter than the retry interval is still waited, then asked once more', async () => {
+  const s = await stub([verdict('unhealthy', 'restarting', 5), verdict('want')])
+  try {
+    const c = clock()
+    const start = c.now()
+    const got = await decide(s.env(), one, c)
+    assert.equal(got.runner.label, 'badgery-macos')
+    assert.equal(c.now() - start, 5_000)
+  } finally {
+    await s.close()
+  }
+})
+
+test('a route already answered keeps its answer while another waits', async () => {
+  const routes = parseRoutes({ INPUT_ROUTES: 'win: badgery-windows -> windows-latest\nmac: badgery-macos -> macos-15' })
+  const two = (win, mac) => ({ labels: { ...(win && { win }), mac }, graceSeconds: 180 })
+  const s = await stub([
+    two({ answer: 'fallback', reason: 'no Windows here' }, { answer: 'unhealthy' }),
+    two(null, { answer: 'want' }),
+  ])
+  try {
+    const got = await decide(s.env(), routes, clock())
+    assert.equal(got.win.label, 'windows-latest')
+    assert.match(got.win.reason, /no Windows/)
+    assert.equal(got.mac.label, 'badgery-macos')
+    // The second ask is only about the route still waiting.
+    assert.deepEqual(s.seen.picks[1].body, { labels: { mac: 'badgery-macos' } })
+  } finally {
+    await s.close()
+  }
 })
