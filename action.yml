@@ -1,0 +1,26 @@
+name: Badgery runner picker
+description: >-
+  Route a workflow's jobs to Badgery when it is healthy and has what they ask
+  for, and to your own fallback runners when it is not.
+inputs:
+  want:
+    description: The Badgery label to use when Badgery can take the job.
+    required: false
+  fallback:
+    description: The label to use otherwise. Yours; Badgery never chooses it.
+    required: false
+  routes:
+    description: >-
+      Several routes, one per line, as `key: want -> fallback`. Each key
+      becomes an output. Use instead of want/fallback.
+    required: false
+  server:
+    description: The Badgery server's public origin.
+    required: false
+    default: https://hooks.badgery.ai
+outputs:
+  runner:
+    description: The label chosen for want/fallback. With routes, one output per key.
+runs:
+  using: node24
+  main: index.js
